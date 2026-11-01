@@ -1,0 +1,16 @@
+node_modules
+dist
+logs
+.git
+.gitignore
+.vscode
+.env
+.env.*
+*.log
+coverage
+README.md
+AWS_DEPLOYMENT_GUIDE.md
+scripts
+.github
+
+
