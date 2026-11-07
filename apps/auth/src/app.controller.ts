@@ -42,9 +42,10 @@ export class AppController {
   @Version('1')
   healthCheck() {
     return {
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-    };
+    status: 'ok',
+    env: 'aws-uat-auto',
+    timestamp: new Date().toISOString(),
+  };
   }
 
   @Get('sendmail')
