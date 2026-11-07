@@ -175,30 +175,39 @@ if [ -z "${KMS_KEY_ID}" ] || [ "${KMS_KEY_ID}" = "None" ]; then
 fi
 echo "    KMS 密钥 ID: ${KMS_KEY_ID}"
 
+export DEFAULT_SDB_PASS="${SDB_PASS:-NestJsProd2026!Pass}"
+export DEFAULT_REDIS_PASS="${REDIS_PASS:-}"
+export DEFAULT_JWT_SECRET="${JWT_SECRET:-$(head -c 32 /dev/urandom | base64)}"
+export DEFAULT_MAIL_PASS="${MAIL_PASS:-your_smtp_auth_code}"
+
+SECRET_JSON=$(node -e '
+  console.log(JSON.stringify({
+    SDB_PASS: process.env.DEFAULT_SDB_PASS,
+    REDIS_PASS: process.env.DEFAULT_REDIS_PASS,
+    JWT_SECRET: process.env.DEFAULT_JWT_SECRET,
+    MAIL_PASS: process.env.DEFAULT_MAIL_PASS
+  }));
+')
+
 SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "nestjs/prod/env" --region "${AWS_REGION}" --query "ARN" --output text 2>/dev/null || true)
 if [ -z "${SECRET_ARN}" ] || [ "${SECRET_ARN}" = "None" ]; then
   echo "    创建 Secrets Manager 机密: nestjs/prod/env..."
-  # 预置随机强密码与 JWT 密钥
-  DEFAULT_SDB_PASS="${SDB_PASS:-NestJsProd2026!Pass}"
-  DEFAULT_REDIS_PASS="${REDIS_PASS:-}"
-  DEFAULT_JWT_SECRET="${JWT_SECRET:-$(head -c 32 /dev/urandom | base64)}"
-  DEFAULT_MAIL_PASS="${MAIL_PASS:-your_smtp_auth_code}"
-
-  SECRET_JSON=$(node -e '
-    console.log(JSON.stringify({
-      SDB_PASS: process.env.DEFAULT_SDB_PASS,
-      REDIS_PASS: process.env.DEFAULT_REDIS_PASS,
-      JWT_SECRET: process.env.DEFAULT_JWT_SECRET,
-      MAIL_PASS: process.env.DEFAULT_MAIL_PASS
-    }));
-  ')
-
   SECRET_ARN=$(aws secretsmanager create-secret \
     --name "nestjs/prod/env" \
     --kms-key-id "alias/nestjs-prod-key" \
     --secret-string "${SECRET_JSON}" \
     --region "${AWS_REGION}" \
     --query "ARN" --output text)
+else
+  # 校验现有机密中是否包含完整的 SDB_PASS 键，若为空对象则自动修复写入
+  EXISTING_SDB_PASS=$(aws secretsmanager get-secret-value --secret-id "${SECRET_ARN}" --region "${AWS_REGION}" --query "SecretString" --output text 2>/dev/null | node -e "const fs=require('fs'); try { const d=JSON.parse(fs.readFileSync(0,'utf8')); process.stdout.write(d.SDB_PASS || ''); } catch(e){}" || true)
+  if [ -z "${EXISTING_SDB_PASS}" ]; then
+    echo "    修复填充 Secrets Manager 机密键值: nestjs/prod/env..."
+    aws secretsmanager put-secret-value \
+      --secret-id "${SECRET_ARN}" \
+      --secret-string "${SECRET_JSON}" \
+      --region "${AWS_REGION}" >/dev/null
+  fi
 fi
 echo "    Secret ARN: ${SECRET_ARN}"
 
