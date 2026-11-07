@@ -326,39 +326,99 @@ ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns "${ALB_ARN}" --
 echo "    ALB 访问公网域名: http://${ALB_DNS}"
 
 # ------------------------------------------------------------------------------
-# 9. 自动检测 RDS 与 ElastiCache 端点并注册 Task Definitions
+# 9. 自动检测/创建 RDS PostgreSQL 与 ElastiCache Redis 并注册 Task Definitions
 # ------------------------------------------------------------------------------
-echo "==> [9/10] 检测数据层端点并注册 ARM64 Task Definitions..."
-RDS_ENDPOINT=$(aws rds describe-db-instances --region "${AWS_REGION}" \
-  --filters "Name=db-instance-id,Values=*postgres*,*nest*" \
-  --query "DBInstances[0].Endpoint.Address" --output text 2>/dev/null || true)
+echo "==> [9/10] 检查/创建数据层 (RDS PostgreSQL & ElastiCache Redis) 并注册 ARM64 Task Definitions..."
 
-if [ -z "${RDS_ENDPOINT}" ] || [ "${RDS_ENDPOINT}" = "None" ]; then
-  # 降级尝试查找首个可用 RDS 实例
-  RDS_ENDPOINT=$(aws rds describe-db-instances --region "${AWS_REGION}" --query "DBInstances[0].Endpoint.Address" --output text 2>/dev/null || true)
+# 9.1 检查/创建 ElastiCache 子网组与 Redis 实例 (nestjs-redis)
+REDIS_CLUSTER_ID="nestjs-redis"
+REDIS_SUBNET_GROUP="nestjs-redis-subnet-group"
+if ! aws elasticache describe-cache-subnet-groups --cache-subnet-group-name "${REDIS_SUBNET_GROUP}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "    创建 ElastiCache 子网组: ${REDIS_SUBNET_GROUP}..."
+  aws elasticache create-cache-subnet-group \
+    --cache-subnet-group-name "${REDIS_SUBNET_GROUP}" \
+    --cache-subnet-group-description "Subnet group for NestJS Redis" \
+    --subnet-ids "${SUBNET_ID_1}" "${SUBNET_ID_2}" \
+    --region "${AWS_REGION}" >/dev/null
 fi
 
-if [ -z "${RDS_ENDPOINT}" ] || [ "${RDS_ENDPOINT}" = "None" ]; then
-  echo "⚠️  未在当前区域检测到现成 RDS PostgreSQL 实例，请确保已创建 RDS 并绑定安全组 ${RDS_SG_ID}"
-  RDS_ENDPOINT="nestjs-postgres.placeholder.rds.amazonaws.com"
-else
-  echo "    检测到 RDS 端点: ${RDS_ENDPOINT}"
+if ! aws elasticache describe-cache-clusters --cache-cluster-id "${REDIS_CLUSTER_ID}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "    创建 ElastiCache Redis 实例: ${REDIS_CLUSTER_ID} (cache.t4g.micro)..."
+  aws elasticache create-cache-cluster \
+    --cache-cluster-id "${REDIS_CLUSTER_ID}" \
+    --engine redis \
+    --cache-node-type cache.t4g.micro \
+    --num-cache-nodes 1 \
+    --cache-subnet-group-name "${REDIS_SUBNET_GROUP}" \
+    --security-group-ids "${REDIS_SG_ID}" \
+    --region "${AWS_REGION}" >/dev/null
 fi
 
-REDIS_ENDPOINT=$(aws elasticache describe-replication-groups --region "${AWS_REGION}" \
-  --query "ReplicationGroups[0].NodeGroups[0].PrimaryEndpoint.Address" --output text 2>/dev/null || true)
-
-if [ -z "${REDIS_ENDPOINT}" ] || [ "${REDIS_ENDPOINT}" = "None" ]; then
-  REDIS_ENDPOINT=$(aws elasticache describe-cache-clusters --region "${AWS_REGION}" --show-cache-node-info \
-    --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" --output text 2>/dev/null || true)
+# 9.2 检查/创建 RDS 子网组与 PostgreSQL 实例 (nestjs-postgres)
+RDS_INSTANCE_ID="nestjs-postgres"
+RDS_SUBNET_GROUP="nestjs-rds-subnet-group"
+if ! aws rds describe-db-subnet-groups --db-subnet-group-name "${RDS_SUBNET_GROUP}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "    创建 RDS 子网组: ${RDS_SUBNET_GROUP}..."
+  aws rds create-db-subnet-group \
+    --db-subnet-group-name "${RDS_SUBNET_GROUP}" \
+    --db-subnet-group-description "Subnet group for NestJS RDS PostgreSQL" \
+    --subnet-ids "${SUBNET_ID_1}" "${SUBNET_ID_2}" \
+    --region "${AWS_REGION}" >/dev/null
 fi
 
-if [ -z "${REDIS_ENDPOINT}" ] || [ "${REDIS_ENDPOINT}" = "None" ]; then
-  echo "⚠️  未在当前区域检测到现成 ElastiCache Redis 实例，请确保已创建并绑定安全组 ${REDIS_SG_ID}"
-  REDIS_ENDPOINT="nestjs-redis.placeholder.cache.amazonaws.com"
-else
-  echo "    检测到 Redis 端点: ${REDIS_ENDPOINT}"
+if ! aws rds describe-db-instances --db-instance-identifier "${RDS_INSTANCE_ID}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "    创建 RDS PostgreSQL 实例: ${RDS_INSTANCE_ID} (db.t4g.micro, 20GB gp3)..."
+  DB_MASTER_PASS=$(aws secretsmanager get-secret-value --secret-id "${SECRET_ARN}" --region "${AWS_REGION}" --query "SecretString" --output text | node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync(0,'utf8')); process.stdout.write(d.SDB_PASS || 'NestJsProd2026!Pass');")
+  aws rds create-db-instance \
+    --db-instance-identifier "${RDS_INSTANCE_ID}" \
+    --db-instance-class db.t4g.micro \
+    --engine postgres \
+    --allocated-storage 20 \
+    --storage-type gp3 \
+    --db-name typeorm_test \
+    --master-username crm \
+    --master-user-password "${DB_MASTER_PASS}" \
+    --vpc-security-group-ids "${RDS_SG_ID}" \
+    --db-subnet-group-name "${RDS_SUBNET_GROUP}" \
+    --backup-retention-period 0 \
+    --no-multi-az \
+    --no-publicly-accessible \
+    --region "${AWS_REGION}" >/dev/null
 fi
+
+# 9.3 等待 Redis 与 RDS 就绪并获取连接端点
+echo "    等待 ElastiCache Redis (${REDIS_CLUSTER_ID}) 与 RDS (${RDS_INSTANCE_ID}) 就绪..."
+while true; do
+  REDIS_ENDPOINT=$(aws elasticache describe-cache-clusters \
+    --cache-cluster-id "${REDIS_CLUSTER_ID}" \
+    --show-cache-node-info \
+    --region "${AWS_REGION}" \
+    --query "CacheClusters[0].CacheNodes[0].Endpoint.Address" \
+    --output text 2>/dev/null || echo "")
+
+  RDS_ENDPOINT=$(aws rds describe-db-instances \
+    --db-instance-identifier "${RDS_INSTANCE_ID}" \
+    --region "${AWS_REGION}" \
+    --query "DBInstances[0].Endpoint.Address" \
+    --output text 2>/dev/null || echo "")
+
+  RDS_STATUS=$(aws rds describe-db-instances \
+    --db-instance-identifier "${RDS_INSTANCE_ID}" \
+    --region "${AWS_REGION}" \
+    --query "DBInstances[0].DBInstanceStatus" \
+    --output text 2>/dev/null || echo "creating")
+
+  if [ -n "${REDIS_ENDPOINT}" ] && [ "${REDIS_ENDPOINT}" != "None" ] && \
+     [ -n "${RDS_ENDPOINT}" ] && [ "${RDS_ENDPOINT}" != "None" ] && \
+     [ "${RDS_STATUS}" = "available" ]; then
+    break
+  fi
+  echo "    [$(date +%H:%M:%S)] 数据层初始化中 (RDS 状态: ${RDS_STATUS}, Redis 端点: ${REDIS_ENDPOINT:-等待分配})..."
+  sleep 15
+done
+
+echo "    ✅ 检测到 RDS 端点: ${RDS_ENDPOINT}"
+echo "    ✅ 检测到 Redis 端点: ${REDIS_ENDPOINT}"
 
 # 注册 nestjs-order-task
 echo "    注册 Task Definition: nestjs-order-task..."

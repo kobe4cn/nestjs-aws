@@ -83,6 +83,12 @@ if aws elasticache describe-replication-groups --replication-group-id "nestjs-re
     --no-retain-primary-cluster \
     --region "${REGION}" >/dev/null 2>&1 || true
 fi
+if aws elasticache describe-cache-clusters --cache-cluster-id "nestjs-redis" --region "${REGION}" >/dev/null 2>&1; then
+  echo "    触发删除 ElastiCache Cache Cluster: nestjs-redis..."
+  aws elasticache delete-cache-cluster \
+    --cache-cluster-id "nestjs-redis" \
+    --region "${REGION}" >/dev/null 2>&1 || true
+fi
 
 # 5. 删除 ECR 镜像仓库
 echo "==> [5/11] 删除 ECR 镜像仓库 (nestjs-auth & nestjs-order)..."
@@ -138,13 +144,28 @@ done
 echo "    ✅ RDS nestjs-postgres 已彻底销毁"
 
 echo "    正在等待 ElastiCache nestjs-redis 完全销毁..."
-while aws elasticache describe-replication-groups --replication-group-id "nestjs-redis" --region "${REGION}" >/dev/null 2>&1; do
-  STATUS=$(aws elasticache describe-replication-groups --replication-group-id "nestjs-redis" --region "${REGION}" --query "ReplicationGroups[0].Status" --output text 2>/dev/null || echo "deleted")
-  if [ "${STATUS}" = "deleted" ]; then break; fi
-  echo "    Redis 状态: ${STATUS}，等待中..."
+while aws elasticache describe-replication-groups --replication-group-id "nestjs-redis" --region "${REGION}" >/dev/null 2>&1 || \
+      aws elasticache describe-cache-clusters --cache-cluster-id "nestjs-redis" --region "${REGION}" >/dev/null 2>&1; do
+  echo "    Redis 正在销毁中，等待 15 秒..."
   sleep 15
 done
 echo "    ✅ ElastiCache nestjs-redis 已彻底销毁"
+
+# 删除 RDS 与 Redis 子网组
+aws rds delete-db-subnet-group --db-subnet-group-name "nestjs-rds-subnet-group" --region "${REGION}" >/dev/null 2>&1 || true
+aws elasticache delete-cache-subnet-group --cache-subnet-group-name "nestjs-redis-subnet-group" --region "${REGION}" >/dev/null 2>&1 || true
+
+# 清理可能创建在 Default VPC 下的项目专用安全组 (alb-sg, ecs-auth-sg, ecs-order-sg, rds-sg, redis-sg)
+PROJECT_SGS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=alb-sg,ecs-auth-sg,ecs-order-sg,rds-sg,redis-sg" --region "${REGION}" --query "SecurityGroups[].GroupId" --output text 2>/dev/null || true)
+for sg in ${PROJECT_SGS}; do
+  RULES=$(aws ec2 describe-security-groups --group-ids "${sg}" --region "${REGION}" --query "SecurityGroups[0].IpPermissions" --output json 2>/dev/null || true)
+  if [ -n "${RULES}" ] && [ "${RULES}" != "[]" ]; then
+    aws ec2 revoke-security-group-ingress --group-id "${sg}" --ip-permissions "${RULES}" --region "${REGION}" 2>/dev/null || true
+  fi
+done
+for sg in ${PROJECT_SGS}; do
+  aws ec2 delete-security-group --group-id "${sg}" --region "${REGION}" 2>/dev/null || true
+done
 
 # 11. 删除安全组、子网、路由表、IGW 及 VPC
 echo "==> [11/11] 删除安全组、子网与 项目-vpc..."

@@ -1,11 +1,17 @@
 version: 0.2
 
 # ==============================================================================
-# AWS CodeBuild CI/CD 构建与 UAT 环境编排规范 (ARM64 原生环境)
-# 支持通过环境变量 PIPELINE_ACTION 控制行为：
-#   - deploy (默认) : 编译 + 单元测试 -> 构建 ARM64 镜像 -> (若 UAT 已启动) 推送 ECR + 数据库迁移 + 滚动更新 ECS
-#   - init          : 全自动创建 UAT 基础设施 (init-aws-infra.sh) -> 构建并推送镜像 -> 数据库迁移 -> 启动并更新 ECS
-#   - destroy       : 全自动销毁所有 UAT 基础设施与计费资源 (destroy-aws-infra.sh)，实现零费用
+# AWS CodeBuild 全自动 CI/CD 与 UAT 环境编排规范 (ARM64 原生环境 - 模式 1)
+#
+# 默认行为 (PIPELINE_ACTION=deploy 或 init)：
+#   1. install    : 配置 Node.js 24 与 pnpm 10，安装锁定依赖
+#   2. pre_build  : 编译 auth/order + 跑单元测试 -> 自动检查/创建 ECR 镜像仓库
+#   3. build      : 原生构建 auth 与 order 的 linux/arm64 镜像并推送至 ECR
+#   4. post_build : 自动检查/创建全套 UAT 基础设施 (VPC/SG/KMS/Secrets/RDS/Redis/ALB/ECS)
+#                   -> 执行 RDS 数据库 Migration -> 滚动更新 ECS 服务并输出 ALB 访问地址
+#
+# 销毁行为 (PIPELINE_ACTION=destroy)：
+#   一键清空所有 UAT 计费资源 (destroy-aws-infra.sh)
 # ==============================================================================
 
 env:
@@ -26,7 +32,7 @@ phases:
     commands:
       - |
         set -e
-        echo "==> [Install] 当前流水线动作: PIPELINE_ACTION=${PIPELINE_ACTION}"
+        echo "==> [Install] 当前流水线模式: PIPELINE_ACTION=${PIPELINE_ACTION}"
         if [ "${PIPELINE_ACTION}" = "destroy" ]; then
           echo "ℹ️ 当前为销毁模式 (destroy)，跳过 Node.js 依赖安装。"
           exit 0
@@ -54,17 +60,15 @@ phases:
         echo "==> [CI 3/3] 执行单元测试..."
         pnpm test --runInBand
 
-        if [ "${PIPELINE_ACTION}" = "init" ]; then
-          echo "==> [Infra Init] 正在自动初始化 AWS UAT 基础设施 (VPC / RDS / Redis / ALB / ECS / ECR)..."
-          chmod +x ./scripts/init-aws-infra.sh
-          AUTO_DEPLOY=false AWS_REGION="${AWS_DEFAULT_REGION}" bash ./scripts/init-aws-infra.sh
-        fi
-
-        echo "==> [Pre-Build] 解析 AWS 账号与镜像版本标签..."
-        export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-        export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-        export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
-        echo "ECR Registry: ${ECR_REGISTRY}, Image Tag: ${IMAGE_TAG}"
+        echo "==> [ECR] 检查并自动创建 ECR 镜像仓库 (${AUTH_REPO} & ${ORDER_REPO})..."
+        for repo in "${AUTH_REPO}" "${ORDER_REPO}"; do
+          if ! aws ecr describe-repositories --repository-names "${repo}" --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1; then
+            echo "    创建 ECR 仓库: ${repo}..."
+            aws ecr create-repository --repository-name "${repo}" --region "${AWS_DEFAULT_REGION}" >/dev/null
+          else
+            echo "    ECR 仓库已存在: ${repo}"
+          fi
+        done
 
   build:
     commands:
@@ -80,18 +84,28 @@ phases:
         export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
         export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
         export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
+        echo "ECR Registry: ${ECR_REGISTRY}, Image Tag: ${IMAGE_TAG}"
 
-        echo "==> [Build 1/2] 构建 auth 生产容器镜像 (linux/arm64)..."
+        echo "==> [Build 1/3] 构建 auth 生产容器镜像 (linux/arm64)..."
         docker build --build-arg APP_NAME=auth -t "${ECR_REGISTRY}/${AUTH_REPO}:${IMAGE_TAG}" -t "${ECR_REGISTRY}/${AUTH_REPO}:latest" .
-        echo "==> [Build 2/2] 构建 order 生产容器镜像 (linux/arm64)..."
+
+        echo "==> [Build 2/3] 构建 order 生产容器镜像 (linux/arm64)..."
         docker build --build-arg APP_NAME=order -t "${ECR_REGISTRY}/${ORDER_REPO}:${IMAGE_TAG}" -t "${ECR_REGISTRY}/${ORDER_REPO}:latest" .
+
+        echo "==> [Build 3/3] 登录 AWS ECR 并推送双服务镜像..."
+        aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+        docker push "${ECR_REGISTRY}/${AUTH_REPO}:${IMAGE_TAG}"
+        docker push "${ECR_REGISTRY}/${AUTH_REPO}:latest"
+        docker push "${ECR_REGISTRY}/${ORDER_REPO}:${IMAGE_TAG}"
+        docker push "${ECR_REGISTRY}/${ORDER_REPO}:latest"
+        echo "✅ 镜像推送 ECR 完成！"
 
   post_build:
     commands:
       - |
         set -e
         if [ "${CODEBUILD_BUILD_SUCCEEDING}" != "1" ]; then
-          echo "❌ 构建阶段未通过，中止后续流程。"
+          echo "❌ 构建阶段未通过，中止后续部署流程。"
           exit 1
         fi
 
@@ -100,54 +114,33 @@ phases:
           exit 0
         fi
 
-        export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-        export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-        export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
+        echo "==> [CD 1/3] 自动检查并编排 AWS UAT 基础设施 (VPC / SG / KMS / Secrets / RDS / Redis / ALB / ECS)..."
+        chmod +x ./scripts/init-aws-infra.sh
+        AUTO_DEPLOY=false AWS_REGION="${AWS_DEFAULT_REGION}" bash ./scripts/init-aws-infra.sh
 
-        echo "==> [CD 1/3] 检查 ECR 镜像仓库状态..."
-        if aws ecr describe-repositories --repository-names "${AUTH_REPO}" "${ORDER_REPO}" --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1; then
-          echo "登录 AWS ECR 并推送镜像..."
-          aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-          docker push "${ECR_REGISTRY}/${AUTH_REPO}:${IMAGE_TAG}"
-          docker push "${ECR_REGISTRY}/${AUTH_REPO}:latest"
-          docker push "${ECR_REGISTRY}/${ORDER_REPO}:${IMAGE_TAG}"
-          docker push "${ECR_REGISTRY}/${ORDER_REPO}:latest"
-          echo "✅ 镜像推送 ECR 完成！"
-        else
-          echo "ℹ️ 未检测到 ECR 仓库 (${AUTH_REPO}/${ORDER_REPO})，跳过镜像推送（如需拉起 UAT 环境请运行 pnpm aws:init 或在 GitHub Actions 选择 init）。"
-          exit 0
+        echo "==> [CD 2/3] 执行 RDS 数据库 TypeORM Migration..."
+        AUTH_SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=ecs-auth-sg" --region "${AWS_DEFAULT_REGION}" --query "SecurityGroups[0].GroupId" --output text)
+        VPC_ID=$(aws ec2 describe-security-groups --group-ids "${AUTH_SG_ID}" --region "${AWS_DEFAULT_REGION}" --query "SecurityGroups[0].VpcId" --output text)
+        SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" --region "${AWS_DEFAULT_REGION}" --query "Subnets[0:2].SubnetId" --output text | tr '\t' ',')
+
+        echo "启动 ECS 一次性数据库迁移任务 (${MIGRATION_TASK_DEF}, Subnets: ${SUBNET_IDS}, SG: ${AUTH_SG_ID})..."
+        TASK_ARN=$(aws ecs run-task \
+          --cluster "${ECS_CLUSTER}" \
+          --task-definition "${MIGRATION_TASK_DEF}" \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[${SUBNET_IDS}],securityGroups=[${AUTH_SG_ID}],assignPublicIp=ENABLED}" \
+          --overrides '{"containerOverrides":[{"name":"auth","command":["node","./node_modules/typeorm/cli.js","migration:run","-d","dist/apps/auth/lib/common/database/data-source.js"]}]}' \
+          --region "${AWS_DEFAULT_REGION}" \
+          --query 'tasks[0].taskArn' \
+          --output text)
+        echo "等待迁移任务执行完成 (${TASK_ARN})..."
+        aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" --region "${AWS_DEFAULT_REGION}"
+        EXIT_CODE=$(aws ecs describe-tasks --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" --region "${AWS_DEFAULT_REGION}" --query 'tasks[0].containers[0].exitCode' --output text)
+        if [ "${EXIT_CODE}" != "0" ]; then
+          echo "❌ 数据库 Migration 失败，容器退出码: ${EXIT_CODE}"
+          exit 1
         fi
-
-        echo "==> [CD 2/3] 检查 ECS 集群状态并执行数据库 Migration..."
-        CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "${ECS_CLUSTER}" --region "${AWS_DEFAULT_REGION}" --query "clusters[0].status" --output text 2>/dev/null || echo "NONE")
-        if [ "${CLUSTER_STATUS}" != "ACTIVE" ]; then
-          echo "ℹ️ 未检测到活动中的 ECS 集群 (${ECS_CLUSTER})，跳过 ECS 部署阶段。"
-          exit 0
-        fi
-
-        SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=项目-subnet-public*" --region "${AWS_DEFAULT_REGION}" --query "Subnets[].SubnetId" --output text 2>/dev/null | tr '\t' ',' || true)
-        AUTH_SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=ecs-auth-sg" --region "${AWS_DEFAULT_REGION}" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
-
-        if [ -n "${SUBNET_IDS}" ] && [ -n "${AUTH_SG_ID}" ] && [ "${AUTH_SG_ID}" != "None" ]; then
-          echo "启动 ECS 一次性数据库迁移任务 (${MIGRATION_TASK_DEF})..."
-          TASK_ARN=$(aws ecs run-task \
-            --cluster "${ECS_CLUSTER}" \
-            --task-definition "${MIGRATION_TASK_DEF}" \
-            --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${SUBNET_IDS}],securityGroups=[${AUTH_SG_ID}],assignPublicIp=ENABLED}" \
-            --overrides '{"containerOverrides":[{"name":"auth","command":["node","./node_modules/typeorm/cli.js","migration:run","-d","dist/apps/auth/lib/common/database/data-source.js"]}]}' \
-            --region "${AWS_DEFAULT_REGION}" \
-            --query 'tasks[0].taskArn' \
-            --output text)
-          echo "等待迁移任务执行完成 (${TASK_ARN})..."
-          aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" --region "${AWS_DEFAULT_REGION}"
-          EXIT_CODE=$(aws ecs describe-tasks --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" --region "${AWS_DEFAULT_REGION}" --query 'tasks[0].containers[0].exitCode' --output text)
-          if [ "${EXIT_CODE}" != "0" ]; then
-            echo "❌ 数据库 Migration 失败，容器退出码: ${EXIT_CODE}"
-            exit 1
-          fi
-          echo "✅ 数据库 Migration 执行成功！"
-        fi
+        echo "✅ 数据库 Migration 执行成功！"
 
         echo "==> [CD 3/3] 触发 ECS 服务滚动更新 (${ORDER_SERVICE} & ${AUTH_SERVICE})..."
         aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ORDER_SERVICE}" --force-new-deployment --region "${AWS_DEFAULT_REGION}" >/dev/null
@@ -157,7 +150,7 @@ phases:
 
         ALB_DNS=$(aws elbv2 describe-load-balancers --names "nestjs-alb" --region "${AWS_DEFAULT_REGION}" --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
         echo "=============================================================================="
-        echo "🎉 CodeBuild CI/CD 全流程发布完成！"
+        echo "🎉 CodeBuild CI/CD 全流程构建与 UAT 部署完成！"
         if [ -n "${ALB_DNS}" ] && [ "${ALB_DNS}" != "None" ]; then
           echo "🌐 UAT 环境访问地址: http://${ALB_DNS}"
           echo "🩺 健康检查接口:     http://${ALB_DNS}/api/v1/health"
