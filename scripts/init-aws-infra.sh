@@ -222,7 +222,7 @@ get_or_create_sg() {
     --filters "Name=vpc-id,Values=${VPC_ID}" "Name=group-name,Values=${sg_name}" \
     --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
   if [ -z "${id}" ] || [ "${id}" = "None" ]; then
-    echo "    创建安全组: ${sg_name}..."
+    echo "    创建安全组: ${sg_name}..." >&2
     id=$(aws ec2 create-security-group \
       --group-name "${sg_name}" \
       --description "${sg_desc}" \

@@ -109,9 +109,9 @@ if aws secretsmanager describe-secret --secret-id "nestjs/prod/env" --region "${
     --region "${REGION}" >/dev/null 2>&1 || true
 fi
 
-# 7. 删除 CloudWatch 日志组
-echo "==> [7/11] 删除所有 CloudWatch 日志组..."
-for lg in $(aws logs describe-log-groups --region "${REGION}" --query "logGroups[*].logGroupName" --output text 2>/dev/null || true); do
+# 7. 删除 ECS CloudWatch 日志组 (保留 /aws/codebuild/* 构建日志组)
+echo "==> [7/11] 删除 ECS CloudWatch 日志组 (/ecs/*)..."
+for lg in $(aws logs describe-log-groups --log-group-name-prefix "/ecs/" --region "${REGION}" --query "logGroups[*].logGroupName" --output text 2>/dev/null || true); do
   if [ -n "${lg}" ] && [ "${lg}" != "None" ]; then
     echo "    删除日志组: ${lg}..."
     aws logs delete-log-group --log-group-name "${lg}" --region "${REGION}" >/dev/null 2>&1 || true
