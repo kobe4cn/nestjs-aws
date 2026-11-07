@@ -44,6 +44,7 @@ export class AppController {
     return {
     status: 'ok',
     env: 'aws-uat-auto',
+    push:'push test',
     timestamp: new Date().toISOString(),
   };
   }

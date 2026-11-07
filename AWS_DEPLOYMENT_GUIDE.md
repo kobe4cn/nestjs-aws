@@ -1,6 +1,51 @@
-# NestJS (`auth` & `order`) AWS 生产环境完整部署手册
+# NestJS (`auth` & `order`) AWS 生产与 UAT 环境完整部署手册
 
-本手册基于项目最新适配完成的代码状态编写，涵盖从 **本地 Podman/Docker 容器构建与上传 ECR**，到 **KMS、Secrets Manager、RDS、ElastiCache、IAM、ALB、ECS Fargate 及数据库 Migration** 的全流程配置。
+本手册基于项目最新适配完成的代码状态编写，涵盖：
+1. **全自动 CI/CD 可视化交付流水线**：从 **GitHub Actions CI** 自动触发 **AWS CodePipeline 三阶段可视化流水线 (`Source -> Build -> Deploy`)**，在 **AWS CodeBuild (ARM64)** 中自动完成镜像构建、ECR 推送、UAT 基础设施从 0 自愈拉起、RDS 数据库 Migration，并由 CodePipeline 原生部署器滚动更新 ECS 服务。
+2. **底层云原生架构与手动配置指南**：涵盖 **VPC、安全组、KMS、Secrets Manager、RDS PostgreSQL、ElastiCache Redis、IAM、ALB、ECS Fargate (Service Connect) 及一键销毁省钱方案**。
+
+---
+
+## 零、3 分钟快速上手：从 0 全自动搭建 CI/CD 与 UAT 环境
+
+### 0.1 全自动 CI/CD 交付链路图
+
+```mermaid
+flowchart LR
+    Push["git push origin main"] --> GHA["GitHub Actions (ci.yml)<br/>1. 编译 auth & order<br/>2. 运行 Jest 单元测试"]
+    GHA -->|测试通过后自动自愈检查<br/>打包上传 source.zip| S3[("Amazon S3 版本化桶<br/>nestjs-codepipeline-artifacts-*")]
+    S3 --> CP1["CodePipeline Stage 1: Source<br/>GitHub-Main-Source"]
+    CP1 --> CP2["CodePipeline Stage 2: Build<br/>CodeBuild (nestjs-aws-cicd / ARM64)<br/>1. 构建推送 ECR 镜像<br/>2. init-aws-infra.sh 从 0 自动创建/补齐 UAT 资源<br/>3. 运行 ECS Fargate 一次性数据库 Migration<br/>4. 输出 imagedefinitions-*.json"]
+    CP2 --> CP3["CodePipeline Stage 3: Deploy<br/>Amazon ECS 原生滚动更新<br/>并行发布 order-service & auth-service"]
+    CP3 --> UAT["AWS ALB 公网访问<br/>GET /api/v1/health"]
+```
+
+### 0.2 从 0 开始的核心命令
+
+1. **首次在新 AWS 账号 / 新仓库初始化 CI/CD（只需执行一次）**：
+   ```bash
+   pnpm codebuild:setup      # 创建 AWS CodeBuild (ARM64) 项目与服务角色
+   pnpm codepipeline:setup   # 创建 AWS CodePipeline 三阶段可视化流水线与 S3 版本化制品桶
+   pnpm github:cd:setup      # 创建最小权限 IAM 用户并将加密凭据自动注入 GitHub Secrets
+   ```
+2. **日常代码发布 / 销毁后从 0 重新拉起全套 UAT 资源（只需 1 条命令）**：
+   ```bash
+   git push origin main
+   # 或在本地不提交代码直接触发流水线：
+   pnpm codepipeline:start
+   ```
+   > **全自动从 0 自愈能力**：即使你之前运行了 `pnpm aws:destroy`、`pnpm codebuild:destroy`、`pnpm codepipeline:destroy` 把云端资源全部清空，`git push origin main`（或 `pnpm codepipeline:start`）也会自动巡检并从 0 重建缺失的 CodeBuild、CodePipeline 以及 ECR、KMS、Secrets Manager、安全组、RDS、Redis、ALB 和 ECS 服务，随后自动执行数据库迁移并完成滚动部署。
+3. **查看流水线可视化状态**：
+   - **终端查看**：`pnpm codepipeline:status`
+   - **AWS 控制台可视化看板**：`https://ap-southeast-2.console.aws.amazon.com/codesuite/codepipeline/pipelines/nestjs-aws-pipeline/view?region=ap-southeast-2`
+4. **测试完毕销毁资源（停止按小时计费，账单归零）**：
+   ```bash
+   # 仅销毁所有产生费用的 UAT 运行资源（ECS/ALB/RDS/Redis/ECR/Secrets/KMS/SG）
+   pnpm aws:destroy
+
+   # 若需连同 CodePipeline、S3 制品桶、CodeBuild 项目也彻底清空：
+   pnpm aws:destroy && pnpm codepipeline:destroy && pnpm codebuild:destroy
+   ```
 
 ---
 
@@ -156,36 +201,42 @@ flowchart TD
 
 ### 5.2 使用项目内置自动化脚本打包、迁移与发布
 
-项目中已为你生成了本地一键发布脚本 [`scripts/deploy-aws.sh`](./scripts/deploy-aws.sh)、[`package.json`](./package.json) 快捷命令以及 GitHub Actions 自动部署流水线 [`.github/workflows/deploy-aws.yml`](./.github/workflows/deploy-aws.yml)。
+项目中已内置完整的云端与本地自动化发布体系：
+- **GitHub Actions + AWS CodePipeline 云端全自动流水线（推荐）**：[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) + [`buildspec.yml`](./buildspec.yml) + [`scripts/setup-aws-codepipeline.sh`](./scripts/setup-aws-codepipeline.sh) + [`scripts/setup-aws-codebuild.sh`](./scripts/setup-aws-codebuild.sh) + [`scripts/setup-github-oidc.sh`](./scripts/setup-github-oidc.sh)
+- **基础设施从 0 编排与销毁脚本**：[`scripts/init-aws-infra.sh`](./scripts/init-aws-infra.sh) + [`scripts/destroy-aws-infra.sh`](./scripts/destroy-aws-infra.sh)
+- **本地一键发布脚本**：[`scripts/deploy-aws.sh`](./scripts/deploy-aws.sh)
 
-#### 方式一：本地命令行一键发布（通过 [`scripts/deploy-aws.sh`](./scripts/deploy-aws.sh)）
+#### 方式一：GitHub Actions + AWS CodePipeline 云端全自动发布（推荐首选）
+
+1. **首次配置 GitHub Actions 与 AWS CodePipeline 授权**：
+   ```bash
+   pnpm codebuild:setup      # 创建 AWS CodeBuild (ARM64) 项目与服务角色
+   pnpm codepipeline:setup   # 创建 AWS CodePipeline 三阶段流水线与 S3 版本化桶
+   pnpm github:cd:setup      # 自动创建最小权限 IAM 账号 (nestjs-github-ci) 并加密写入 GitHub Secrets
+   ```
+   执行 `pnpm github:cd:setup` 后，脚本会自动通过 `gh secret set` 将 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` 加密写入 GitHub 仓库 Secrets，并设置仓库变量 `AWS_REGION=ap-southeast-2`，全程无需手动复制粘贴密钥。
+2. **触发自动构建、基础设施自愈、数据库迁移与 ECS 滚动发布**：
+   - **日常推送触发**：直接执行 `git push origin main`。
+   - **GitHub 网页手动触发**：在 GitHub 仓库 **Actions** -> **NestJS CI/CD (UAT)** -> 点击 **Run workflow**，可选择：
+     - `deploy`（默认）：运行 CI 单测 -> 触发 CodePipeline 三阶段流水线（若 UAT 资源不存在会自动从 0 创建） -> 执行数据库 Migration -> 滚动更新 ECS 服务。
+     - `init`：初始化 UAT 基础设施并部署。
+     - `destroy`：直接在云端 CodeBuild 中执行 [`scripts/destroy-aws-infra.sh`](./scripts/destroy-aws-infra.sh)，一键销毁全部 UAT 计费资源。
+
+#### 方式二：本地命令行一键发布（通过 [`scripts/deploy-aws.sh`](./scripts/deploy-aws.sh)）
 
 ```bash
 # 0. 若尚未安装 AWS CLI，先通过 Homebrew 安装并配置凭证
-#    获取 Access Key 步骤：
-#    登录 AWS 控制台 -> 点击右上角账号名 -> Security credentials (安全凭证)
-#    -> 下拉到 Access keys (访问密钥) -> 点击 Create access key (创建访问密钥)
-#    -> 选择 Command Line Interface (CLI) -> 勾选确认并创建，复制 Access key ID 和 Secret access key
 brew install awscli
 aws configure
-# 依次输入：
-#   AWS Access Key ID [None]: 粘贴你的 Access key ID (如 AKIAIOSFODNN7EXAMPLE)
-#   AWS Secret Access Key [None]: 粘贴你的 Secret access key
-#   Default region name [None]: 输入你的区域代码 (如 ap-southeast-1)
-#   Default output format [None]: 输入 json (或直接回车)
 
-# 1. 设置你的 AWS 环境参数
-#   - AWS_REGION : AWS 控制台右上角当前区域代码（如新加坡 ap-southeast-1、东京 ap-northeast-1、美东 us-east-1）
-#   - SUBNET_IDS : VPC -> Subnets (子网) 列表中，两个子网的 Subnet ID（用英文逗号拼接，中间不要有空格）
-#                  方案 A (带 NAT) 填 2 个 Private 子网 ID；方案 B (无 NAT) 填 2 个 Public 子网 ID
-#   - AUTH_SG_ID : VPC -> Security Groups (安全组) 列表中，名为 ecs-auth-sg 的 Security group ID
+# 1. 设置你的 AWS 环境参数（若不手动指定，deploy-aws.sh 会自动探测当前 VPC、子网与 ecs-auth-sg）
 export AWS_REGION="ap-southeast-2"
 export SUBNET_IDS="subnet-xxxxxxxxxxxxxxxxx,subnet-yyyyyyyyyyyyyyyyy"
 export AUTH_SG_ID="sg-xxxxxxxxxxxxxxxxx"
 
 # 方案 A (私有子网 + NAT Gateway) 设为 DISABLED
 # 方案 B (公有子网 + 免 NAT Gateway) 设为 ENABLED
-export ASSIGN_PUBLIC_IP="DISABLED"
+export ASSIGN_PUBLIC_IP="ENABLED"
 
 # 2. 一键执行：构建双镜像推送 ECR -> 运行 ECS Migration 任务并等待完成 -> 滚动更新 order 与 auth
 pnpm aws:deploy
@@ -195,13 +246,6 @@ pnpm aws:push      # 仅构建并推送 auth 与 order 镜像到 ECR
 pnpm aws:migrate   # 仅运行 ECS 一次性任务执行 RDS TypeORM Migration（失败会自动中止并返回非 0 状态码）
 pnpm aws:rollout   # 仅触发 order 与 auth ECS 服务强制滚动更新
 ```
-
-#### 方式二：GitHub Actions 自动发布（[`.github/workflows/deploy-aws.yml`](./.github/workflows/deploy-aws.yml)）
-
-在 GitHub 仓库的 **Settings -> Secrets and variables -> Actions** 中配置以下 3 个 Repository Secrets 后，每次推送到 `main` 分支（或手动在 Actions 页面点击 Run workflow 选择网络模式 `DISABLED` / `ENABLED`）即可全自动完成构建、迁移与滚动发布：
-* `AWS_ROLE_ARN`：GitHub OIDC 关联的 AWS IAM Role ARN
-* `ECS_SUBNET_IDS`：`subnet-xxxx,subnet-yyyy`
-* `ECS_AUTH_SG_ID`：`sg-xxxx` (即 `ecs-auth-sg` 的安全组 ID)
 
 #### 方式三：手动执行原生 Podman 与 AWS CLI 命令
 
@@ -498,4 +542,30 @@ pnpm aws:migrate
    ```
 4. **验证 RDS 数据库与 `auth` -> `order` 跨容器 TCP 调用**：
    调用登录与 `/api/v1/user/findcustomerorder/:id` 接口，验证 `auth` 通过 `order.nestjs.internal:3031` 调用 `order` 微服务并查询 RDS 数据。
+
+---
+
+## 十、AWS CodePipeline 可视化运维与资源清理速查
+
+### 10.1 AWS CodePipeline 三阶段职责说明
+
+在 AWS 控制台进入 **CodePipeline -> Pipelines -> `nestjs-aws-pipeline`**，可直观查看以下 3 个阶段：
+
+| 阶段 (Stage) | 动作名称 (Action) | 执行内容 |
+| :--- | :--- | :--- |
+| **1. Source** | `GitHub-Main-Source` | 从版本化 S3 制品桶拉取 GitHub Actions CI 测试通过后上传的最新源码包 `source.zip`（内含当前 `.git_commit_sha`）。 |
+| **2. Build** | `CodeBuild-ARM64-Build-And-Migrate` | 调用 [`buildspec.yml`](./buildspec.yml)：<br/>1. 编译单测并构建 `auth` 与 `order` 的 `linux/arm64` 容器镜像推送到 ECR；<br/>2. 调用 [`scripts/init-aws-infra.sh`](./scripts/init-aws-infra.sh) 自动检查并从 0 补齐缺失的 KMS、Secrets Manager、5 个安全组、ECS 集群、ALB、ElastiCache Redis 与 RDS PostgreSQL；<br/>3. 启动 ECS Fargate 一次性任务执行 TypeORM 数据库迁移；<br/>4. 输出 `imagedefinitions-order.json` 与 `imagedefinitions-auth.json` 构建制品。 |
+| **3. Deploy** | `Deploy-Order-Service`<br/>`Deploy-Auth-Service` | AWS CodePipeline 原生 Amazon ECS 部署动作：消费阶段 2 生成的镜像定义制品，并行触发 `order-service` 与 `auth-service` 的滚动更新，并实时追踪新旧容器替换与 ALB 健康检查状态。 |
+
+### 10.2 常用运维与销毁命令汇总
+
+| 场景 | 命令 | 说明 |
+| :--- | :--- | :--- |
+| **查看流水线状态** | `pnpm codepipeline:status` | 在终端输出 CodePipeline 三个阶段与动作的最新状态及时间戳 |
+| **手动触发流水线** | `pnpm codepipeline:start` | 自动自愈缺失的 CodeBuild/CodePipeline 组件，打包当前代码上传 S3 并启动流水线 |
+| **查看构建历史** | `pnpm codebuild:status` | 查看 `nestjs-aws-cicd` 项目信息与最近 5 次构建状态 |
+| **销毁 UAT 计费资源（日常省钱）** | `pnpm aws:destroy` | 销毁 ECS、ALB、RDS、Redis、ECR、Secrets Manager、KMS 别名、安全组与 `/ecs/*` 日志组（停止计费，账单归零） |
+| **彻底清空全部云上资源** | `pnpm aws:destroy && pnpm codepipeline:destroy && pnpm codebuild:destroy` | 在销毁 UAT 资源的基础上，连同 CodePipeline、S3 版本化制品桶、CodeBuild 项目与 IAM 服务角色一并删除 |
+| **清理 GitHub CI 凭据** | `bash ./scripts/setup-github-oidc.sh destroy` | 删除 IAM 账号 `nestjs-github-ci` 并清理 GitHub 仓库中的 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` 与 `AWS_REGION` |
+
 

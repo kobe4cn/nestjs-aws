@@ -44,6 +44,9 @@ flowchart LR
 
 ```text
 nestjs-aws/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                   # GitHub Actions CI/CD 流水线 (单测 -> 触发 AWS CodePipeline)
 ├── apps/
 │   ├── auth/                        # 主应用 & API 网关 (HTTP 默认端口 3000)
 │   │   ├── src/
@@ -77,11 +80,19 @@ nestjs-aws/
 │       ├── mail/                    # 邮件模块及 Handlebars (.hbs) 邮件模板
 │       └── param/                   # 参数提取工具
 ├── scripts/
-│   └── deploy-aws.sh                # AWS ECR 构建推送、RDS 迁移与 ECS 滚动发布脚本
+│   ├── init-aws-infra.sh            # AWS UAT 全套基础设施幂等检查与从 0 自动创建脚本 (IaC)
+│   ├── destroy-aws-infra.sh         # AWS UAT 计费资源一键彻底销毁脚本 (零残留省钱停机)
+│   ├── deploy-aws.sh                # 本地容器构建推送 ECR、RDS 迁移与 ECS 滚动发布脚本
+│   ├── setup-aws-codebuild.sh       # AWS CodeBuild (ARM64) 项目与 IAM 角色自动化管理脚本
+│   ├── setup-aws-codepipeline.sh    # AWS CodePipeline 三阶段可视化流水线管理与自愈脚本
+│   ├── setup-github-oidc.sh         # GitHub Actions 专用最小权限 IAM 账号与 Secrets 自动注入脚本
+│   ├── duckdb-quack-server.sh       # DuckDB Quack 云服务器一键管理脚本
+│   └── DUCKDB_QUACK_README.md       # DuckDB Quack 脚本使用说明
+├── buildspec.yml                    # AWS CodeBuild 构建、基础设施自愈编排、数据库迁移与制品规范
 ├── Dockerfile                       # 支持多应用构建参数 (APP_NAME=auth|order) 的多阶段 Dockerfile
-├── AWS_DEPLOYMENT_GUIDE.md          # AWS 生产环境完整部署手册
+├── AWS_DEPLOYMENT_GUIDE.md          # AWS 生产/UAT 环境完整部署与 CI/CD 手册
 ├── nest-cli.json                    # Nest CLI Monorepo 与 SWC 编译配置
-└── package.json                     # 项目依赖与脚本命令
+└── package.json                     # 项目依赖与全生命周期快捷脚本命令
 ```
 
 ---
@@ -90,12 +101,12 @@ nestjs-aws/
 
 ### 3.1 基础环境要求
 
-* **Node.js**：`>= 22.x`（推荐使用 Node 22 LTS）
-* **包管理器**：`pnpm`（`corepack enable`）
+* **Node.js**：`>= 24.x`（NestJS 12 + Jest 30 依赖 Node 24 原生 ESM 模块支持）
+* **包管理器**：`pnpm`（`>= 10.x`，可通过 `corepack enable` 启用）
 * **基础服务**：
   * **PostgreSQL**：`>= 15.x`
   * **Redis**：`>= 6.x`
-* **容器工具（可选）**：`Podman` 或 `Docker`（用于本地构建生产镜像或推送到 AWS ECR）
+* **容器与云工具（可选）**：`Podman` 或 `Docker`、`AWS CLI v2`、`GitHub CLI (gh)`
 
 ### 3.2 安装依赖
 
@@ -249,36 +260,97 @@ pnpm test:e2e
 
 ---
 
-## 七、容器化构建与 AWS 云上部署
+## 七、容器化构建、CI/CD 流水线与 AWS 云上部署
 
-本项目采用单 [`Dockerfile`](Dockerfile) 多阶段构建设计，通过 `--build-arg APP_NAME=auth` 或 `order` 分别打包对应微服务镜像，并内置了完整的 AWS 自动化发布脚本 [`scripts/deploy-aws.sh`](scripts/deploy-aws.sh)（自动兼容 `podman` 与 `docker`）。
+本项目采用单 [`Dockerfile`](Dockerfile) 多阶段构建设计，通过 `--build-arg APP_NAME=auth` 或 `order` 分别打包对应微服务镜像，并内置了**从 GitHub Actions CI 到 AWS CodePipeline 三阶段可视化流水线 + UAT 基础设施从 0 自动自愈编排**的完整云原生交付闭环。
 
-### 7.1 本地构建容器镜像
+### 7.1 全自动 CI/CD 与 AWS CodePipeline 三阶段可视化架构
 
-```bash
-# 构建 auth 生产镜像 (linux/arm64)
-pnpm image:build:auth
-
-# 构建 order 生产镜像 (linux/arm64)
-pnpm image:build:order
+```mermaid
+flowchart LR
+    Dev["开发者 git push"] --> GH["GitHub Actions (ci.yml)<br/>Job 1: 编译与单元测试"]
+    GH -->|Job 2: 自动巡检自愈并上传源码| S3[("S3 版本化制品桶<br/>source.zip")]
+    S3 --> Stage1["CodePipeline Stage 1: Source<br/>GitHub-Main-Source"]
+    Stage1 --> Stage2["CodePipeline Stage 2: Build<br/>AWS CodeBuild (ARM64)<br/>1. 构建双镜像推送 ECR<br/>2. init-aws-infra.sh 自动补齐/拉起 UAT 资源<br/>3. 运行 ECS 一次性数据库 Migration"]
+    Stage2 -->|输出 imagedefinitions-*.json| Stage3["CodePipeline Stage 3: Deploy<br/>Amazon ECS 原生滚动部署<br/>并行更新 order-service & auth-service"]
+    Stage3 --> ALB["AWS ALB 公网网关<br/>/api/v1/health (200 OK)"]
 ```
 
-### 7.2 AWS 一键发布流水线
+#### （1）全新环境首次一次性初始化（仅需执行一次）
 
-配置好 AWS CLI 凭证与基础设施参数后，可通过以下命令完成全自动部署：
+在配置好本地 `aws configure` 与 `gh auth login` 后，按顺序执行以下 3 条命令即可完成云端流水线与 GitHub 仓库密钥绑定：
 
 ```bash
-# 1.【首次上线或新账号/新区域】一键自动创建并配置全部 AWS 底座与服务：
-#    （包含：IAM角色策略、ECR、KMS、Secrets、5个安全组互通、CloudWatch、ECS集群Service Connect、ALB目标组负载均衡、Task Definitions及ECS服务）
+# 1. 创建 AWS CodeBuild 项目 (nestjs-aws-cicd) 与 IAM 服务角色
+pnpm codebuild:setup
+
+# 2. 创建 AWS CodePipeline 三阶段可视化流水线 (nestjs-aws-pipeline) 与 S3 版本化制品桶
+pnpm codepipeline:setup
+
+# 3. 创建 GitHub CI 最小权限 IAM 账号并自动加密写入 GitHub Actions Secrets
+pnpm github:cd:setup
+```
+
+#### （2）日常全自动发布（支持从 0 自动自愈拉起 UAT 资源）
+
+无论是日常迭代，还是在执行了 `pnpm aws:destroy`（甚至删掉了 CodeBuild/CodePipeline）之后重新从 0 拉起环境，都**只需执行以下任一操作**：
+
+```bash
+# 方式 A（推荐）：直接推送代码到 main 分支，自动触发 GitHub CI -> AWS CodePipeline 全流程
+git push origin main
+
+# 方式 B：不改代码，在本地直接打包当前代码触发 AWS CodePipeline 三阶段流水线
+pnpm codepipeline:start
+
+# 随时在终端查看 CodePipeline 三个阶段 (Source -> Build -> Deploy) 的实时状态
+pnpm codepipeline:status
+```
+
+### 7.2 本地手动构建与运维命令（可选）
+
+```bash
+# 本地使用 Podman 构建生产镜像 (linux/arm64)
+pnpm image:build:auth
+pnpm image:build:order
+
+# 在本地直接检查/创建全套 AWS UAT 基础设施 (VPC/SG/KMS/Secrets/RDS/Redis/ALB/ECS)
 pnpm aws:init
 
-# 2.【日常代码变更】一键执行部署全流程：构建推送双镜像 -> ECS 一次性任务执行 RDS Migration -> 滚动更新 order 与 auth 服务
+# 在本地使用容器引擎构建推送双镜像 -> 执行 RDS Migration -> 滚动更新 ECS 服务
 pnpm aws:deploy
-
-# 或分步独立执行：
 pnpm aws:push      # 仅构建并推送 auth 与 order 镜像至 Amazon ECR
 pnpm aws:migrate   # 仅启动 ECS Fargate 一次性任务执行 TypeORM Migration
 pnpm aws:rollout   # 仅触发 ECS order-service 与 auth-service 强制滚动更新
 ```
 
-> 有关 VPC 子网规划、安全组最小权限配置、KMS 密钥与 Secrets Manager 机密注入、RDS PostgreSQL、ElastiCache Redis、ECS Service Connect 内网通信及 ALB 负载均衡的详细步骤，请参阅项目根目录下的 **[《AWS 生产环境完整部署手册》(AWS_DEPLOYMENT_GUIDE.md)](AWS_DEPLOYMENT_GUIDE.md)**。
+### 7.3 AWS 资源销毁与零账单停机命令
+
+```bash
+# 【常用推荐】一键销毁所有按小时计费的 UAT 运行资源（ECS/ALB/RDS/Redis/ECR/Secrets/KMS/SG）
+# 执行后 AWS 产生费用归零；下次 git push 时会自动从 0 重新拉起全套资源
+pnpm aws:destroy
+
+# 【彻底清空】将 UAT 资源 + CodePipeline + S3 制品桶 + CodeBuild 项目全部删除
+pnpm aws:destroy && pnpm codepipeline:destroy && pnpm codebuild:destroy
+```
+
+### 7.4 全生命周期脚本命令速查表
+
+| 分类 | 命令 | 对应脚本 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **CI/CD 流水线** | `pnpm codepipeline:setup` | [`scripts/setup-aws-codepipeline.sh`](scripts/setup-aws-codepipeline.sh) | 创建/更新三阶段 CodePipeline（若底层 CodeBuild 缺失会自动补齐） |
+| | `pnpm codepipeline:start` | [`scripts/setup-aws-codepipeline.sh`](scripts/setup-aws-codepipeline.sh) | 自动巡检自愈 CI/CD 组件、上传最新代码并启动 CodePipeline |
+| | `pnpm codepipeline:status` | [`scripts/setup-aws-codepipeline.sh`](scripts/setup-aws-codepipeline.sh) | 查看 CodePipeline `Source -> Build -> Deploy` 各阶段状态 |
+| | `pnpm codepipeline:destroy` | [`scripts/setup-aws-codepipeline.sh`](scripts/setup-aws-codepipeline.sh) | 删除 CodePipeline、IAM 角色并清空删除 S3 版本化制品桶 |
+| | `pnpm codebuild:setup` | [`scripts/setup-aws-codebuild.sh`](scripts/setup-aws-codebuild.sh) | 创建/更新 ARM64 CodeBuild 项目（`nestjs-aws-cicd`） |
+| | `pnpm codebuild:start` | [`scripts/setup-aws-codebuild.sh`](scripts/setup-aws-codebuild.sh) | 单独触发 CodeBuild 云端构建与部署 |
+| | `pnpm codebuild:destroy-uat` | [`scripts/setup-aws-codebuild.sh`](scripts/setup-aws-codebuild.sh) | 在云端 CodeBuild 容器内远程执行 UAT 资源销毁 |
+| | `pnpm codebuild:status` | [`scripts/setup-aws-codebuild.sh`](scripts/setup-aws-codebuild.sh) | 查看 CodeBuild 项目配置与最近 5 次构建记录 |
+| | `pnpm codebuild:destroy` | [`scripts/setup-aws-codebuild.sh`](scripts/setup-aws-codebuild.sh) | 删除 CodeBuild 项目、IAM 角色与构建日志组 |
+| | `pnpm github:cd:setup` | [`scripts/setup-github-oidc.sh`](scripts/setup-github-oidc.sh) | 创建最小权限 IAM 用户并将加密凭据注入 GitHub Actions Secrets |
+| **AWS 基础设施** | `pnpm aws:init` | [`scripts/init-aws-infra.sh`](scripts/init-aws-infra.sh) | 幂等检查并从 0 创建 ECR/KMS/Secrets/SG/RDS/Redis/ALB/ECS |
+| | `pnpm aws:destroy` | [`scripts/destroy-aws-infra.sh`](scripts/destroy-aws-infra.sh) | 一键销毁全部 UAT 计费资源，停止账单计费 |
+| | `pnpm aws:deploy` | [`scripts/deploy-aws.sh`](scripts/deploy-aws.sh) | 本地打包推送 ECR + 运行数据库迁移 + ECS 滚动更新 |
+| **DuckDB 节点** | `pnpm quack:create` / `status` / `ssh` / `destroy` | [`scripts/duckdb-quack-server.sh`](scripts/duckdb-quack-server.sh) | 详见 [`scripts/DUCKDB_QUACK_README.md`](scripts/DUCKDB_QUACK_README.md) |
+
+> 有关 VPC 子网规划、安全组最小权限配置、KMS 密钥与 Secrets Manager 机密注入、RDS PostgreSQL、ElastiCache Redis、ECS Service Connect 内网通信、ALB 负载均衡及 CI/CD 流水线的详细说明，请参阅项目根目录下的 **[《AWS 生产环境完整部署手册》(AWS_DEPLOYMENT_GUIDE.md)](AWS_DEPLOYMENT_GUIDE.md)**。
