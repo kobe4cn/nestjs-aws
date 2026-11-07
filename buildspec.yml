@@ -1,17 +1,17 @@
 version: 0.2
 
 # ==============================================================================
-# AWS CodeBuild CI/CD 构建规范 (ARM64 原生构建环境)
-# 阶段说明：
-# 1. install    : 启用 Node.js 24 与 pnpm 10，安装项目锁定依赖
-# 2. pre_build  : 编译 auth 与 order 微服务，执行单元测试，解析 ECR 元数据
-# 3. build      : 基于 Dockerfile 原生构建 auth 与 order 的 linux/arm64 生产镜像
-# 4. post_build : 若云端 ECR / ECS 已初始化，自动推送镜像、执行数据库迁移并滚动更新服务
+# AWS CodeBuild CI/CD 构建与 UAT 环境编排规范 (ARM64 原生环境)
+# 支持通过环境变量 PIPELINE_ACTION 控制行为：
+#   - deploy (默认) : 编译 + 单元测试 -> 构建 ARM64 镜像 -> (若 UAT 已启动) 推送 ECR + 数据库迁移 + 滚动更新 ECS
+#   - init          : 全自动创建 UAT 基础设施 (init-aws-infra.sh) -> 构建并推送镜像 -> 数据库迁移 -> 启动并更新 ECS
+#   - destroy       : 全自动销毁所有 UAT 基础设施与计费资源 (destroy-aws-infra.sh)，实现零费用
 # ==============================================================================
 
 env:
   variables:
     AWS_DEFAULT_REGION: "ap-southeast-2"
+    PIPELINE_ACTION: "deploy"
     AUTH_REPO: "nestjs-auth"
     ORDER_REPO: "nestjs-order"
     ECS_CLUSTER: "nestjs-prod-cluster"
@@ -24,43 +24,85 @@ phases:
     runtime-versions:
       nodejs: 24
     commands:
-      - echo "==> [Install] 配置 Node.js 与 pnpm 环境..."
-      - node -v
-      - corepack enable || npm install -g pnpm@10
-      - corepack prepare pnpm@10 --activate || true
-      - pnpm -v
-      - echo "==> [Install] 安装项目依赖..."
-      - pnpm install --frozen-lockfile
+      - |
+        set -e
+        echo "==> [Install] 当前流水线动作: PIPELINE_ACTION=${PIPELINE_ACTION}"
+        if [ "${PIPELINE_ACTION}" = "destroy" ]; then
+          echo "ℹ️ 当前为销毁模式 (destroy)，跳过 Node.js 依赖安装。"
+          exit 0
+        fi
+        echo "==> [Install] 配置 Node.js 与 pnpm 环境..."
+        node -v
+        corepack enable || npm install -g pnpm@10
+        corepack prepare pnpm@10 --activate || true
+        pnpm -v
+        echo "==> [Install] 安装项目锁定依赖..."
+        pnpm install --frozen-lockfile
 
   pre_build:
     commands:
-      - echo "==> [CI 1/3] 编译 auth 微服务..."
-      - pnpm exec nest build auth
-      - echo "==> [CI 2/3] 编译 order 微服务..."
-      - pnpm exec nest build order
-      - echo "==> [CI 3/3] 执行单元测试..."
-      - pnpm test --runInBand
-      - echo "==> [Pre-Build] 解析 AWS 账号与镜像版本标签..."
-      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-      - export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-      - export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
-      - echo "ECR Registry: ${ECR_REGISTRY}, Image Tag: ${IMAGE_TAG}"
+      - |
+        set -e
+        if [ "${PIPELINE_ACTION}" = "destroy" ]; then
+          exit 0
+        fi
+
+        echo "==> [CI 1/3] 编译 auth 微服务..."
+        pnpm exec nest build auth
+        echo "==> [CI 2/3] 编译 order 微服务..."
+        pnpm exec nest build order
+        echo "==> [CI 3/3] 执行单元测试..."
+        pnpm test --runInBand
+
+        if [ "${PIPELINE_ACTION}" = "init" ]; then
+          echo "==> [Infra Init] 正在自动初始化 AWS UAT 基础设施 (VPC / RDS / Redis / ALB / ECS / ECR)..."
+          chmod +x ./scripts/init-aws-infra.sh
+          AUTO_DEPLOY=false AWS_REGION="${AWS_DEFAULT_REGION}" bash ./scripts/init-aws-infra.sh
+        fi
+
+        echo "==> [Pre-Build] 解析 AWS 账号与镜像版本标签..."
+        export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+        export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
+        echo "ECR Registry: ${ECR_REGISTRY}, Image Tag: ${IMAGE_TAG}"
 
   build:
     commands:
-      - echo "==> [Build 1/2] 构建 auth 生产容器镜像 (linux/arm64)..."
-      - docker build --build-arg APP_NAME=auth -t "${ECR_REGISTRY}/${AUTH_REPO}:${IMAGE_TAG}" -t "${ECR_REGISTRY}/${AUTH_REPO}:latest" .
-      - echo "==> [Build 2/2] 构建 order 生产容器镜像 (linux/arm64)..."
-      - docker build --build-arg APP_NAME=order -t "${ECR_REGISTRY}/${ORDER_REPO}:${IMAGE_TAG}" -t "${ECR_REGISTRY}/${ORDER_REPO}:latest" .
+      - |
+        set -e
+        if [ "${PIPELINE_ACTION}" = "destroy" ]; then
+          echo "==> [Infra Destroy] 开始全量销毁 AWS UAT 基础设施与计费资源..."
+          chmod +x ./scripts/destroy-aws-infra.sh
+          AWS_REGION="${AWS_DEFAULT_REGION}" bash ./scripts/destroy-aws-infra.sh
+          exit 0
+        fi
+
+        export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+        export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
+
+        echo "==> [Build 1/2] 构建 auth 生产容器镜像 (linux/arm64)..."
+        docker build --build-arg APP_NAME=auth -t "${ECR_REGISTRY}/${AUTH_REPO}:${IMAGE_TAG}" -t "${ECR_REGISTRY}/${AUTH_REPO}:latest" .
+        echo "==> [Build 2/2] 构建 order 生产容器镜像 (linux/arm64)..."
+        docker build --build-arg APP_NAME=order -t "${ECR_REGISTRY}/${ORDER_REPO}:${IMAGE_TAG}" -t "${ECR_REGISTRY}/${ORDER_REPO}:latest" .
 
   post_build:
     commands:
       - |
         set -e
         if [ "${CODEBUILD_BUILD_SUCCEEDING}" != "1" ]; then
-          echo "❌ 构建阶段未通过，中止后续部署流程。"
+          echo "❌ 构建阶段未通过，中止后续流程。"
           exit 1
         fi
+
+        if [ "${PIPELINE_ACTION}" = "destroy" ]; then
+          echo "✅ UAT 环境销毁流程执行完毕！"
+          exit 0
+        fi
+
+        export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+        export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
 
         echo "==> [CD 1/3] 检查 ECR 镜像仓库状态..."
         if aws ecr describe-repositories --repository-names "${AUTH_REPO}" "${ORDER_REPO}" --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1; then
@@ -72,7 +114,7 @@ phases:
           docker push "${ECR_REGISTRY}/${ORDER_REPO}:latest"
           echo "✅ 镜像推送 ECR 完成！"
         else
-          echo "ℹ️ 未检测到 ECR 仓库 (${AUTH_REPO}/${ORDER_REPO})，跳过镜像推送（如需部署到云端请先运行 pnpm aws:init）。"
+          echo "ℹ️ 未检测到 ECR 仓库 (${AUTH_REPO}/${ORDER_REPO})，跳过镜像推送（如需拉起 UAT 环境请运行 pnpm aws:init 或在 GitHub Actions 选择 init）。"
           exit 0
         fi
 
@@ -112,7 +154,15 @@ phases:
         aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${AUTH_SERVICE}" --force-new-deployment --region "${AWS_DEFAULT_REGION}" >/dev/null
         echo "等待服务滚动更新达到稳定状态..."
         aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ORDER_SERVICE}" "${AUTH_SERVICE}" --region "${AWS_DEFAULT_REGION}"
-        echo "🎉 CodeBuild CI/CD 全流程执行完成！"
+
+        ALB_DNS=$(aws elbv2 describe-load-balancers --names "nestjs-alb" --region "${AWS_DEFAULT_REGION}" --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
+        echo "=============================================================================="
+        echo "🎉 CodeBuild CI/CD 全流程发布完成！"
+        if [ -n "${ALB_DNS}" ] && [ "${ALB_DNS}" != "None" ]; then
+          echo "🌐 UAT 环境访问地址: http://${ALB_DNS}"
+          echo "🩺 健康检查接口:     http://${ALB_DNS}/api/v1/health"
+        fi
+        echo "=============================================================================="
 
 cache:
   paths:

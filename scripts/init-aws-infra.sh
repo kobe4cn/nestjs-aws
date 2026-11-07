@@ -559,7 +559,7 @@ else
 fi
 
 echo "=============================================================================="
-echo "🎉 AWS 基础设施全自动配置检查完毕！"
+echo "🎉 AWS UAT 基础设施全自动配置检查完毕！"
 echo "   VPC ID            : ${VPC_ID}"
 echo "   Subnets           : ${SUBNET_IDS}"
 echo "   ALB Domain URL    : http://${ALB_DNS}"
@@ -567,8 +567,19 @@ echo "   ECS Cluster       : ${CLUSTER_NAME}"
 echo "   Auth Service      : auth-service"
 echo "   Order Service     : order-service"
 echo "   Auth SG ID        : ${AUTH_SG_ID}"
-echo ""
-echo "💡 接下来只需在终端执行部署流水线即可完成镜像更新与数据库初始化："
-echo "   pnpm aws:deploy"
 echo "=============================================================================="
+
+# 若 AUTO_DEPLOY=true (默认开启)，自动调用 AWS CodeBuild 完成首次镜像打包推送、数据库迁移与服务更新
+AUTO_DEPLOY="${AUTO_DEPLOY:-true}"
+DEPLOY_MODE="${DEPLOY_MODE:-codebuild}"
+if [ "${AUTO_DEPLOY}" = "true" ]; then
+  if [ "${DEPLOY_MODE}" = "local" ]; then
+    echo "==> [Auto-Deploy] 使用本地容器引擎构建推送镜像并执行迁移..."
+    AWS_REGION="${AWS_REGION}" bash ./scripts/deploy-aws.sh all
+  else
+    echo "==> [Auto-Deploy] 触发 AWS CodeBuild 云端流水线完成镜像构建、ECR 推送、数据库迁移与 ECS 发布..."
+    AWS_REGION="${AWS_REGION}" bash ./scripts/setup-aws-codebuild.sh setup
+    AWS_REGION="${AWS_REGION}" bash ./scripts/setup-aws-codebuild.sh start deploy
+  fi
+fi
 
