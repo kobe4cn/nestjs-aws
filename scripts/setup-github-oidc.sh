@@ -33,7 +33,7 @@ setup_github_cd_auth() {
     echo "    ✅ 专用 IAM 用户已存在: ${CI_USER_NAME}"
   fi
 
-  # 仅授予触发指定 CodePipeline / CodeBuild 与读取构建日志的最小权限
+  # 授予触发与自愈指定 CodePipeline / CodeBuild 及其专属服务角色的最小权限
   USER_POLICY=$(cat <<EOF
 {
   "Version": "2012-10-17",
@@ -42,6 +42,8 @@ setup_github_cd_auth() {
       "Sid": "UploadSourceArtifactToPipelineBucket",
       "Effect": "Allow",
       "Action": [
+        "s3:CreateBucket",
+        "s3:PutBucketVersioning",
         "s3:PutObject",
         "s3:GetObject",
         "s3:ListBucket",
@@ -53,9 +55,12 @@ setup_github_cd_auth() {
       ]
     },
     {
-      "Sid": "TriggerAndMonitorCodePipeline",
+      "Sid": "TriggerAndSelfHealCodePipeline",
       "Effect": "Allow",
       "Action": [
+        "codepipeline:GetPipeline",
+        "codepipeline:CreatePipeline",
+        "codepipeline:UpdatePipeline",
         "codepipeline:StartPipelineExecution",
         "codepipeline:GetPipelineExecution",
         "codepipeline:GetPipelineState",
@@ -67,14 +72,33 @@ setup_github_cd_auth() {
       ]
     },
     {
-      "Sid": "TriggerAndMonitorCodeBuildOnly",
+      "Sid": "TriggerAndSelfHealCodeBuild",
       "Effect": "Allow",
       "Action": [
+        "codebuild:BatchGetProjects",
+        "codebuild:CreateProject",
+        "codebuild:UpdateProject",
         "codebuild:StartBuild",
         "codebuild:BatchGetBuilds",
         "codebuild:ListBuildsForProject"
       ],
       "Resource": "arn:aws:codebuild:${AWS_REGION}:${AWS_ACCOUNT_ID}:project/${CODEBUILD_PROJECT_NAME}"
+    },
+    {
+      "Sid": "SelfHealPipelineAndCodeBuildServiceRolesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:CreateRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:role/nestjs-codebuild-service-role",
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:role/nestjs-codepipeline-service-role"
+      ]
     },
     {
       "Sid": "StreamCodeBuildCloudWatchLogsOnly",

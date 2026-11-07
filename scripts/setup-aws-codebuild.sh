@@ -145,6 +145,13 @@ start_build() {
   local action_mode="${1:-${PIPELINE_ACTION:-deploy}}"
   local commit_Or_branch="${2:-${SOURCE_VERSION}}"
 
+  local existing
+  existing=$(aws codebuild batch-get-projects --names "${PROJECT_NAME}" --region "${AWS_REGION}" --query "projects[0].name" --output text 2>/dev/null || echo "None")
+  if [ "${existing}" != "${PROJECT_NAME}" ]; then
+    echo "==> [自动自愈] 检测到 CodeBuild 项目 (${PROJECT_NAME}) 不存在，正在自动创建..."
+    setup_project
+  fi
+
   echo "==> 触发 AWS CodeBuild 构建 (${PROJECT_NAME}, 模式: ${action_mode}, 版本: ${commit_Or_branch})..."
   BUILD_ID=$(aws codebuild start-build \
     --project-name "${PROJECT_NAME}" \

@@ -140,6 +140,17 @@ EOF
 }
 
 setup_pipeline() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # 确保底层依赖的 CodeBuild 项目 (nestjs-aws-cicd) 已存在，若被清理则自动重建
+  local existing_cb
+  existing_cb=$(aws codebuild batch-get-projects --names "${CODEBUILD_PROJECT}" --region "${AWS_REGION}" --query "projects[0].name" --output text 2>/dev/null || echo "None")
+  if [ "${existing_cb}" != "${CODEBUILD_PROJECT}" ]; then
+    echo "==> [前置自愈] 未检测到 CodeBuild 项目 (${CODEBUILD_PROJECT})，正在自动调用 setup-aws-codebuild.sh 创建..."
+    bash "${script_dir}/setup-aws-codebuild.sh" setup
+  fi
+
   ensure_artifact_bucket
   ensure_pipeline_role
 
@@ -303,6 +314,23 @@ package_and_upload_source() {
 }
 
 start_pipeline() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # 启动前自动巡检：若 CodeBuild 项目、S3 工件桶或 CodePipeline 被销毁，自动从 0 自愈重建
+  local existing_cb
+  existing_cb=$(aws codebuild batch-get-projects --names "${CODEBUILD_PROJECT}" --region "${AWS_REGION}" --query "projects[0].name" --output text 2>/dev/null || echo "None")
+  if [ "${existing_cb}" != "${CODEBUILD_PROJECT}" ]; then
+    echo "==> [自动自愈] 检测到 CodeBuild 项目 (${CODEBUILD_PROJECT}) 不存在，正在自动创建..."
+    bash "${script_dir}/setup-aws-codebuild.sh" setup
+  fi
+
+  if ! aws codepipeline get-pipeline --name "${PIPELINE_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
+     ! aws s3api head-bucket --bucket "${ARTIFACT_BUCKET}" 2>/dev/null; then
+    echo "==> [自动自愈] 检测到 CodePipeline (${PIPELINE_NAME}) 或 S3 工件桶缺失，正在自动初始化..."
+    setup_pipeline
+  fi
+
   echo "==> [1/2] 打包最新 Git 代码并上传至 CodePipeline S3 源 (${ARTIFACT_BUCKET}/source.zip)..."
   package_and_upload_source
 
@@ -342,6 +370,12 @@ start_pipeline() {
       break
     elif [ "${EXEC_STATUS}" != "InProgress" ]; then
       echo "❌ AWS CodePipeline 执行结束，最终状态: ${EXEC_STATUS} (Execution ID: ${EXECUTION_ID})"
+      echo "==> 失败阶段与错误详情："
+      aws codepipeline get-pipeline-state \
+        --name "${PIPELINE_NAME}" \
+        --region "${AWS_REGION}" \
+        --query "stageStates[?latestExecution.status=='Failed'].actionStates[?latestExecution.status=='Failed'].[actionName,latestExecution.errorDetails.message]" \
+        --output table || true
       exit 1
     fi
     sleep 8
