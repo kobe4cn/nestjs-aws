@@ -33,11 +33,39 @@ setup_github_cd_auth() {
     echo "    ✅ 专用 IAM 用户已存在: ${CI_USER_NAME}"
   fi
 
-  # 仅授予触发指定 CodeBuild 项目与拉取构建日志的最小权限
+  # 仅授予触发指定 CodePipeline / CodeBuild 与读取构建日志的最小权限
   USER_POLICY=$(cat <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
+    {
+      "Sid": "UploadSourceArtifactToPipelineBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::nestjs-codepipeline-artifacts-${AWS_ACCOUNT_ID}-${AWS_REGION}",
+        "arn:aws:s3:::nestjs-codepipeline-artifacts-${AWS_ACCOUNT_ID}-${AWS_REGION}/*"
+      ]
+    },
+    {
+      "Sid": "TriggerAndMonitorCodePipeline",
+      "Effect": "Allow",
+      "Action": [
+        "codepipeline:StartPipelineExecution",
+        "codepipeline:GetPipelineExecution",
+        "codepipeline:GetPipelineState",
+        "codepipeline:ListActionExecutions"
+      ],
+      "Resource": [
+        "arn:aws:codepipeline:${AWS_REGION}:${AWS_ACCOUNT_ID}:nestjs-aws-pipeline",
+        "arn:aws:codepipeline:${AWS_REGION}:${AWS_ACCOUNT_ID}:nestjs-aws-pipeline/*"
+      ]
+    },
     {
       "Sid": "TriggerAndMonitorCodeBuildOnly",
       "Effect": "Allow",

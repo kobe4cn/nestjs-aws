@@ -1,17 +1,14 @@
 version: 0.2
 
 # ==============================================================================
-# AWS CodeBuild 全自动 CI/CD 与 UAT 环境编排规范 (ARM64 原生环境 - 模式 1)
+# AWS CodeBuild 全自动 CI/CD 与 UAT 环境编排规范 (ARM64 原生环境 - 支持 CodePipeline)
 #
-# 默认行为 (PIPELINE_ACTION=deploy 或 init)：
-#   1. install    : 配置 Node.js 24 与 pnpm 10，安装锁定依赖
-#   2. pre_build  : 编译 auth/order + 跑单元测试 -> 自动检查/创建 ECR 镜像仓库
-#   3. build      : 原生构建 auth 与 order 的 linux/arm64 镜像并推送至 ECR
-#   4. post_build : 自动检查/创建全套 UAT 基础设施 (VPC/SG/KMS/Secrets/RDS/Redis/ALB/ECS)
-#                   -> 执行 RDS 数据库 Migration -> 滚动更新 ECS 服务并输出 ALB 访问地址
-#
-# 销毁行为 (PIPELINE_ACTION=destroy)：
-#   一键清空所有 UAT 计费资源 (destroy-aws-infra.sh)
+# 配合 AWS CodePipeline 三阶段可视化流水线：
+#   - Stage 1 (Source) : 拉取最新 GitHub 代码包
+#   - Stage 2 (Build)  : 编译单测 -> 创建/推送 ECR 镜像 -> 检查/拉起 UAT 基础设施
+#                        -> 执行 RDS 数据库 Migration -> 生成 imagedefinitions-*.json
+#   - Stage 3 (Deploy) : 由 CodePipeline 原生 Amazon ECS 部署器读取 imagedefinitions-*.json，
+#                        并行滚动部署 order-service 与 auth-service 并可视化追踪进度
 # ==============================================================================
 
 env:
@@ -32,7 +29,7 @@ phases:
     commands:
       - |
         set -e
-        echo "==> [Install] 当前流水线模式: PIPELINE_ACTION=${PIPELINE_ACTION}"
+        echo "==> [Install] 当前流水线模式: PIPELINE_ACTION=${PIPELINE_ACTION}, Initiator=${CODEBUILD_INITIATOR:-standalone}"
         if [ "${PIPELINE_ACTION}" = "destroy" ]; then
           echo "ℹ️ 当前为销毁模式 (destroy)，跳过 Node.js 依赖安装。"
           exit 0
@@ -78,12 +75,18 @@ phases:
           echo "==> [Infra Destroy] 开始全量销毁 AWS UAT 基础设施与计费资源..."
           chmod +x ./scripts/destroy-aws-infra.sh
           AWS_REGION="${AWS_DEFAULT_REGION}" bash ./scripts/destroy-aws-infra.sh
+          echo "[]" > imagedefinitions-order.json
+          echo "[]" > imagedefinitions-auth.json
           exit 0
         fi
 
         export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
         export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-        export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
+        if [ -f ".git_commit_sha" ]; then
+          export IMAGE_TAG=$(cat .git_commit_sha | cut -c 1-7)
+        else
+          export IMAGE_TAG=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}" | cut -c 1-7)
+        fi
         echo "ECR Registry: ${ECR_REGISTRY}, Image Tag: ${IMAGE_TAG}"
 
         echo "==> [Build 1/3] 构建 auth 生产容器镜像 (linux/arm64)..."
@@ -99,6 +102,12 @@ phases:
         docker push "${ECR_REGISTRY}/${ORDER_REPO}:${IMAGE_TAG}"
         docker push "${ECR_REGISTRY}/${ORDER_REPO}:latest"
         echo "✅ 镜像推送 ECR 完成！"
+
+        # 生成供 AWS CodePipeline Stage 3 (Amazon ECS Deploy) 消费的标准镜像定义工件
+        printf '[{"name":"order","imageUri":"%s/%s:%s"}]\n' "${ECR_REGISTRY}" "${ORDER_REPO}" "${IMAGE_TAG}" > imagedefinitions-order.json
+        printf '[{"name":"auth","imageUri":"%s/%s:%s"}]\n' "${ECR_REGISTRY}" "${AUTH_REPO}" "${IMAGE_TAG}" > imagedefinitions-auth.json
+        cat imagedefinitions-order.json
+        cat imagedefinitions-auth.json
 
   post_build:
     commands:
@@ -142,13 +151,21 @@ phases:
         fi
         echo "✅ 数据库 Migration 执行成功！"
 
+        ALB_DNS=$(aws elbv2 describe-load-balancers --names "nestjs-alb" --region "${AWS_DEFAULT_REGION}" --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
+
+        # 若由 AWS CodePipeline 触发，ECS 服务滚动更新交由 CodePipeline 的 Stage 3 (Deploy) 可视化阶段执行
+        if [[ "${CODEBUILD_INITIATOR:-}" == codepipeline/* ]]; then
+          echo "==> [CD 3/3] 检测到由 AWS CodePipeline 驱动，已生成 imagedefinitions 工件，即将进入 CodePipeline Stage 3 (Deploy to ECS) 可视化部署阶段！"
+          echo "🌐 UAT 环境访问地址: http://${ALB_DNS}"
+          exit 0
+        fi
+
         echo "==> [CD 3/3] 触发 ECS 服务滚动更新 (${ORDER_SERVICE} & ${AUTH_SERVICE})..."
         aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ORDER_SERVICE}" --force-new-deployment --region "${AWS_DEFAULT_REGION}" >/dev/null
         aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${AUTH_SERVICE}" --force-new-deployment --region "${AWS_DEFAULT_REGION}" >/dev/null
         echo "等待服务滚动更新达到稳定状态..."
         aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ORDER_SERVICE}" "${AUTH_SERVICE}" --region "${AWS_DEFAULT_REGION}"
 
-        ALB_DNS=$(aws elbv2 describe-load-balancers --names "nestjs-alb" --region "${AWS_DEFAULT_REGION}" --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
         echo "=============================================================================="
         echo "🎉 CodeBuild CI/CD 全流程构建与 UAT 部署完成！"
         if [ -n "${ALB_DNS}" ] && [ "${ALB_DNS}" != "None" ]; then
@@ -156,6 +173,11 @@ phases:
           echo "🩺 健康检查接口:     http://${ALB_DNS}/api/v1/health"
         fi
         echo "=============================================================================="
+
+artifacts:
+  files:
+    - imagedefinitions-order.json
+    - imagedefinitions-auth.json
 
 cache:
   paths:

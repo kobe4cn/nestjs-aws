@@ -74,9 +74,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
 
-      - name: Trigger AWS CodeBuild & Stream Logs
+      - name: Trigger AWS CodePipeline (Source -> CodeBuild -> ECS Deploy)
         env:
           AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
         run: |
-          chmod +x ./scripts/setup-aws-codebuild.sh
-          ./scripts/setup-aws-codebuild.sh start "${{ inputs.pipeline_action || 'deploy' }}" "${{ github.sha }}"
+          chmod +x ./scripts/setup-aws-codepipeline.sh ./scripts/setup-aws-codebuild.sh
+          if [ "${{ inputs.pipeline_action }}" = "destroy" ]; then
+            ./scripts/setup-aws-codebuild.sh start destroy "${{ github.sha }}"
+          else
+            ./scripts/setup-aws-codepipeline.sh start
+          fi
